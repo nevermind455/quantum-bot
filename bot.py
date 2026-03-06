@@ -100,7 +100,7 @@ class Config:
     testnet: bool = False
     leverage: int = 10
     capital_percent: float = 15.0
-    max_open_trades: int = 2
+    max_open_trades: int = 4
     min_score: float = 50.0
     margin_type: str = "CROSSED"          # "ISOLATED" or "CROSSED"
     # Adaptive SL: uses ATR instead of fixed %
@@ -994,15 +994,16 @@ class QuantumBot:
     def get_total_open_count(self):
         """Count ALL open positions on Binance, not just bot-tracked ones."""
         positions = self.api.get_open_positions()
-        if positions is None: return len(self.open_positions)
+        if positions is None:
+            return len(self.open_positions)  # API error, use internal
+        # Sync: if Binance says 0 but we track some, clean up
+        if len(positions) == 0 and len(self.open_positions) > 0:
+            self.logger.info(f"  {C.yellow('Sync:')} Binance has 0 positions. Clearing {len(self.open_positions)} stale tracked positions.")
+            self.open_positions.clear()
         return len(positions)
 
     def can_open_trade(self):
         """Double-check: query Binance AND check internal list."""
-        # Check internal list first (fast)
-        if len(self.open_positions) >= self.config.max_open_trades:
-            return False
-        # Then verify with Binance (authoritative)
         total = self.get_total_open_count()
         return total < self.config.max_open_trades
 
