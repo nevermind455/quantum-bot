@@ -15,7 +15,7 @@
         python bot.py --scan-only (signals only)
 """
 
-import os, sys, json, time, logging, math, statistics
+import os, sys, json, time, logging, math, statistics, signal, atexit
 from datetime import datetime, timezone, timedelta
 from dataclasses import dataclass, field
 from typing import Optional
@@ -98,10 +98,10 @@ class Config:
     api_key: str = ""
     api_secret: str = ""
     testnet: bool = False
-    leverage: int = 10
+    leverage: int = 15
     capital_percent: float = 15.0
-    max_open_trades: int = 4
-    min_score: float = 50.0
+    max_open_trades: int = 2
+    min_score: float = 60.0
     margin_type: str = "CROSSED"          # "ISOLATED" or "CROSSED"
     # Adaptive SL: uses ATR instead of fixed %
     sl_atr_multiplier: float = 1.5        # SL = entry +/- (ATR * 1.5)
@@ -144,6 +144,9 @@ class Config:
     telegram_send_trades: bool = True
     telegram_send_tp_sl: bool = True
     telegram_send_scans: bool = False
+    scan_while_full: bool = True
+    close_positions_on_shutdown: bool = True
+    shutdown_close_all_positions: bool = False
 
 def load_config() -> Config:
     cfg = Config()
@@ -158,13 +161,17 @@ def load_config() -> Config:
     cfg.api_key = os.environ.get("BINANCE_API_KEY", "")
     cfg.api_secret = os.environ.get("BINANCE_API_SECRET", "")
     cfg.testnet = os.environ.get("BINANCE_TESTNET", "false").lower() == "true"
-    cfg.leverage = int(os.environ.get("LEVERAGE", "10"))
+    cfg.leverage = int(os.environ.get("LEVERAGE", "15"))
     cfg.capital_percent = float(os.environ.get("CAPITAL_PERCENT", "15"))
-    cfg.min_score = float(os.environ.get("MIN_SCORE", "50"))
+    cfg.max_open_trades = int(os.environ.get("MAX_OPEN_TRADES", "2"))
+    cfg.min_score = float(os.environ.get("MIN_SCORE", "60"))
     cfg.margin_type = os.environ.get("MARGIN_TYPE", "CROSSED").upper()
     cfg.telegram_token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
     cfg.telegram_chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
     cfg.telegram_enabled = bool(cfg.telegram_token and cfg.telegram_chat_id)
+    cfg.scan_while_full = os.environ.get("SCAN_WHILE_FULL", "true").lower() == "true"
+    cfg.close_positions_on_shutdown = os.environ.get("CLOSE_POSITIONS_ON_SHUTDOWN", "true").lower() == "true"
+    cfg.shutdown_close_all_positions = os.environ.get("SHUTDOWN_CLOSE_ALL_POSITIONS", "false").lower() == "true"
     return cfg
 
 
@@ -820,8 +827,78 @@ class QuantumBot:
         self.current_streak = 0  # +N = win streak, -N = loss streak
         self._paused = False; self._daily_limit_hit = False
         self._last_signals = []; self._pair_cooldowns = {}
+        self._is_shutting_down = False
+        self._shutdown_reason = None
         self.telegram = TelegramBot(config, self.logger)
         self.telegram.set_bot_ref(self)
+        self._load_persisted_stats()
+
+    def _load_persisted_stats(self):
+        """Restore stats from journal so W/L/WR survive restarts and match closed trades."""
+        closes = [t for t in self.trade_logger.trades if t.get("type") == "close"]
+        self.wins = sum(1 for t in closes if float(t.get("pnl", 0) or 0) > 0)
+        self.losses = sum(1 for t in closes if float(t.get("pnl", 0) or 0) < 0)
+        self.trade_count = len(closes)
+        self.total_pnl = sum(float(t.get("pnl", 0) or 0) for t in closes)
+
+        streak = 0
+        for t in closes:
+            pnl = float(t.get("pnl", 0) or 0)
+            if pnl > 0:
+                streak = streak + 1 if streak > 0 else 1
+            elif pnl < 0:
+                streak = streak - 1 if streak < 0 else -1
+        self.current_streak = streak
+        self._register_shutdown_hooks()
+
+
+    def _register_shutdown_hooks(self):
+        atexit.register(self._atexit_shutdown)
+        for sig_name in ("SIGINT", "SIGTERM"):
+            sig = getattr(signal, sig_name, None)
+            if sig is not None:
+                try: signal.signal(sig, self._handle_shutdown_signal)
+                except Exception: pass
+
+    def _handle_shutdown_signal(self, signum, frame):
+        try: sig_name = signal.Signals(signum).name
+        except Exception: sig_name = f"SIGNAL {signum}"
+        self.shutdown(sig_name)
+        raise SystemExit(0)
+
+    def _atexit_shutdown(self):
+        self.shutdown("EXIT")
+
+    def shutdown(self, reason="SHUTDOWN"):
+        if self._is_shutting_down:
+            return
+        self._is_shutting_down = True
+        self._shutdown_reason = reason
+        try:
+            self.logger.info(f"\n\n{C.bg_yellow(' SHUTTING DOWN ')} {C.yellow(reason)}")
+        except Exception:
+            pass
+        try:
+            self.telegram.stop_polling()
+        except Exception:
+            pass
+
+        if self.config.close_positions_on_shutdown:
+            try:
+                if self.config.shutdown_close_all_positions:
+                    self.close_all_positions()
+                else:
+                    self.close_bot_positions()
+            except Exception as e:
+                try: self.logger.error(f"Shutdown close error: {e}")
+                except Exception: pass
+
+        try: self.print_stats()
+        except Exception: pass
+        try: self.logger.info(f"{C.bg_red(' BOT STOPPED ')}")
+        except Exception: pass
+        try: self.telegram.notify_shutdown()
+        except Exception: pass
 
     def print_banner(self):
         print(f"\n{C.line('=', 65)}")
@@ -991,21 +1068,50 @@ class QuantumBot:
         self.telegram.notify_scan_summary(signals, self.scan_count)
         return signals
 
-    def get_total_open_count(self):
-        """Count ALL open positions on Binance, not just bot-tracked ones."""
+    def sync_open_positions(self):
+        """Keep bot-tracked positions aligned with what Binance still has open."""
         positions = self.api.get_open_positions()
         if positions is None:
-            return len(self.open_positions)  # API error, use internal
-        # Sync: if Binance says 0 but we track some, clean up
-        if len(positions) == 0 and len(self.open_positions) > 0:
-            self.logger.info(f"  {C.yellow('Sync:')} Binance has 0 positions. Clearing {len(self.open_positions)} stale tracked positions.")
-            self.open_positions.clear()
+            return None
+        active_symbols = {p["symbol"] for p in positions}
+        if self.open_positions:
+            self.open_positions = [p for p in self.open_positions if p.pair in active_symbols]
+        return positions
+
+    def get_total_open_count(self):
+        """Count ALL open positions on Binance, not just bot-tracked ones."""
+        positions = self.sync_open_positions()
+        if positions is None:
+            return len(self.open_positions)
         return len(positions)
 
     def can_open_trade(self):
-        """Double-check: query Binance AND check internal list."""
+        """Only allow a new trade when total exchange positions are below the limit."""
         total = self.get_total_open_count()
         return total < self.config.max_open_trades
+
+    def enforce_max_open_trades(self):
+        """If total positions exceed the configured max, close excess bot-managed positions."""
+        positions = self.sync_open_positions()
+        if positions is None:
+            return 0
+        total = len(positions)
+        excess = total - self.config.max_open_trades
+        if excess <= 0:
+            return 0
+        self.logger.warning(f"  {C.bg_red(' LIMIT BREACH ')} {total}/{self.config.max_open_trades} open positions. Reducing exposure...")
+        bot_symbols = {p.pair for p in self.open_positions}
+        if not bot_symbols:
+            self.logger.warning("  Over limit, but there are no tracked bot positions available to close.")
+            return 0
+        candidates = [p for p in self.open_positions if p.pair in bot_symbols]
+        # Close newest bot positions first to get back under the cap quickly.
+        candidates.sort(key=lambda p: p.opened_at or "", reverse=True)
+        closed = 0
+        for pos in candidates[:excess]:
+            if self.close_position(pos.pair, reason="LIMIT"):
+                closed += 1
+        return closed
 
     def execute_trade(self, signal):
         # STRICT check - query Binance every time
@@ -1105,7 +1211,7 @@ class QuantumBot:
 
     def monitor_positions(self):
         if not self.open_positions: return
-        positions = self.api.get_open_positions()
+        positions = self.sync_open_positions()
         if positions is None: return
         active_symbols = {p["symbol"] for p in positions}
 
@@ -1117,19 +1223,12 @@ class QuantumBot:
                     open_ts = int(datetime.fromisoformat(pos.opened_at).timestamp()*1000) if pos.opened_at else 0
                     trades = self.api.client.futures_account_trades(symbol=pos.pair, startTime=open_ts, limit=50)
                     for t in trades: pnl += float(t.get("realizedPnl", 0))
-            except: pass
+            except:
+                pass
 
-            self.trade_count += 1; self.total_pnl += pnl; self.daily_pnl += pnl
-            if pnl >= 0:
-                self.wins += 1; self.current_streak = max(1, self.current_streak + 1)
-                self.logger.info(f"  {C.bg_green(' WIN ')} {C.white(pos.pair)} | {C.green(f'+${pnl:.2f}')} | Streak: {C.green(f'{self.current_streak:+d}')}")
-            else:
-                self.losses += 1; self.current_streak = min(-1, self.current_streak - 1)
-                self.logger.info(f"  {C.bg_red(' LOSS ')} {C.white(pos.pair)} | {C.red(f'-${abs(pnl):.2f}')} | Streak: {C.red(f'{self.current_streak:+d}')}")
             self.open_positions.remove(pos)
             self._pair_cooldowns[pos.pair] = time.time()
-            self.telegram.notify_trade_close(pos.pair, "WIN" if pnl >= 0 else "LOSS", pnl)
-            self.trade_logger.log(type="close", pair=pos.pair, pnl=pnl, reason="WIN" if pnl >= 0 else "LOSS", streak=self.current_streak)
+            self._record_closed_trade(pos.pair, pnl)
 
         for pd_ in positions:
             symbol = pd_["symbol"]; mark = self.api.get_mark_price(symbol)
@@ -1160,6 +1259,32 @@ class QuantumBot:
                                 self.logger.info(f"  {C.yellow('TRAIL')} {symbol} ${old:.6f} -> {C.green(f'${new_sl:.6f}')}")
                             except: pos.stop_loss = old
 
+    def _record_closed_trade(self, pair, pnl, reason=None, notify_reason=None):
+        pnl = float(pnl or 0)
+        self.trade_count += 1
+        self.total_pnl += pnl
+        self.daily_pnl += pnl
+
+        if pnl > 0:
+            self.wins += 1
+            self.current_streak = self.current_streak + 1 if self.current_streak > 0 else 1
+            label = "WIN"
+            self.logger.info(f"  {C.bg_green(' WIN ')} {C.white(pair)} | {C.green(f'+${pnl:.2f}')} | Streak: {C.green(f'{self.current_streak:+d}')}")
+        elif pnl < 0:
+            self.losses += 1
+            self.current_streak = self.current_streak - 1 if self.current_streak < 0 else -1
+            label = "LOSS"
+            self.logger.info(f"  {C.bg_red(' LOSS ')} {C.white(pair)} | {C.red(f'-${abs(pnl):.2f}')} | Streak: {C.red(f'{self.current_streak:+d}')}")
+        else:
+            self.current_streak = 0
+            label = reason or "BREAKEVEN"
+            self.logger.info(f"  {C.bg_blue(' FLAT ')} {C.white(pair)} | $0.00 | Streak: {C.dim(f'{self.current_streak:+d}')}")
+
+        close_reason = reason or label
+        telegram_reason = notify_reason or close_reason
+        self.telegram.notify_trade_close(pair, telegram_reason, pnl)
+        self.trade_logger.log(type="close", pair=pair, pnl=pnl, reason=close_reason, streak=self.current_streak)
+
     def print_stats(self):
         wr = (self.wins/(self.wins+self.losses)*100) if (self.wins+self.losses) else 0
         bal = self.api.get_account_balance()
@@ -1175,6 +1300,21 @@ class QuantumBot:
             f"Streak: {streak_c(f'{self.current_streak:+d}')} | "
             f"Open: {C.yellow(open_str)} | Daily: {C.pnl_color(self.daily_pnl)}({dl:+.1f}%)")
         self.logger.info(C.line("=", 75))
+
+    def close_bot_positions(self):
+        if not self.api.client:
+            return
+        tracked = list(self.open_positions)
+        if not tracked:
+            self.logger.info(f"  {C.dim('No bot-managed positions to close.')}")
+            return
+        self.logger.info(f"  Closing {C.white(str(len(tracked)))} bot-managed position(s)...")
+        for pos in tracked:
+            try:
+                self.close_position(pos.pair, reason="SHUTDOWN")
+            except Exception as e:
+                self.logger.error(f"  Bot close failed {pos.pair}: {e}")
+        self.sync_open_positions()
 
     def close_all_positions(self):
         if not self.api.client: return
@@ -1192,10 +1332,7 @@ class QuantumBot:
                 if amt > 0: self.api.client.futures_create_order(symbol=sym, side=SIDE_SELL, type="MARKET", quantity=str(cq))
                 elif amt < 0: self.api.client.futures_create_order(symbol=sym, side=SIDE_BUY, type="MARKET", quantity=str(cq))
                 pnl = float(pd_.get("unRealizedProfit",0))
-                self.trade_count += 1; self.total_pnl += pnl
-                if pnl >= 0: self.wins += 1; self.logger.info(f"  {C.bg_green(' CLOSED ')} {sym} {C.green(f'+${pnl:.2f}')}")
-                else: self.losses += 1; self.logger.info(f"  {C.bg_red(' CLOSED ')} {sym} {C.red(f'-${abs(pnl):.2f}')}")
-                self.telegram.notify_trade_close(sym, "SHUTDOWN", pnl)
+                self._record_closed_trade(sym, pnl, reason="SHUTDOWN", notify_reason="SHUTDOWN")
             except Exception as e: self.logger.error(f"  Close failed {sym}: {e}")
         self.open_positions.clear()
 
@@ -1221,17 +1358,24 @@ class QuantumBot:
                 if self._paused or self._daily_limit_hit:
                     self.logger.info(f"{C.bg_yellow(' PAUSED ')}"); time.sleep(10); continue
                 self.monitor_positions()
+                self.enforce_max_open_trades()
                 if self.check_daily_limit(): continue
                 self.print_stats()
-                total_open = self.get_total_open_count()
-                if total_open >= self.config.max_open_trades:
-                    ext = total_open - len(self.open_positions)
-                    ext_msg = f" ({ext} external)" if ext > 0 else ""
-                    self.logger.info(f"  {C.yellow(f'[{total_open}/{self.config.max_open_trades}]')} Full{ext_msg}. {C.dim('Monitoring...')}")
-                    time.sleep(self.config.scan_interval); continue
+
                 try: signals = self.run_full_scan()
                 except Exception as e:
                     self.logger.error(f"Scan: {C.red(str(e))}"); self.telegram.notify_error(str(e)); signals = []
+
+                total_open = self.get_total_open_count()
+                if total_open >= self.config.max_open_trades:
+                    ext = max(0, total_open - len(self.open_positions))
+                    ext_msg = f" ({ext} external)" if ext > 0 else ""
+                    mode_msg = 'Scanning only, no new entries.' if self.config.scan_while_full else 'Monitoring only.'
+                    self.logger.info(f"  {C.yellow(f'[{total_open}/{self.config.max_open_trades}]')} Full{ext_msg}. {C.dim(mode_msg)}")
+                    self.logger.info(f"\n{C.dim(f'Next scan in {self.config.scan_interval}s...')}\n")
+                    time.sleep(self.config.scan_interval)
+                    continue
+
                 if signals:
                     # Only try ONE trade per scan cycle
                     for sig in signals[:5]:
@@ -1242,10 +1386,9 @@ class QuantumBot:
                 self.logger.info(f"\n{C.dim(f'Next scan in {self.config.scan_interval}s...')}\n")
                 time.sleep(self.config.scan_interval)
         except KeyboardInterrupt:
-            self.logger.info(f"\n\n{C.bg_yellow(' SHUTTING DOWN ')}")
-            self.close_all_positions(); self.print_stats()
-            self.logger.info(f"{C.bg_red(' BOT STOPPED ')}")
-            self.telegram.notify_shutdown(); self.telegram.stop_polling()
+            self.shutdown("KEYBOARD")
+        except SystemExit:
+            pass
 
 def main():
     config = load_config()
